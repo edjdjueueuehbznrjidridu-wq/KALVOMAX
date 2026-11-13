@@ -1,0 +1,100 @@
+name: Build KALVO APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Buildozer Android APK
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract project zip if needed
+        run: |
+          set -euo pipefail
+          if [ -f main.py ] && [ -f buildozer.spec ]; then
+            echo "Project at root"
+            ls -la
+            exit 0
+          fi
+          ZIP=$(ls -1 *.zip 2>/dev/null | head -1 || true)
+          if [ -z "${ZIP:-}" ]; then
+            echo "No main.py and no zip"; ls -la; exit 1
+          fi
+          echo "Extracting $ZIP"
+          unzip -o "$ZIP" -d _e
+          if [ -f _e/main.py ] && [ -f _e/buildozer.spec ]; then
+            cp -a _e/. .
+          else
+            SUB=$(find _e -name main.py | head -1 | xargs -r dirname)
+            test -n "${SUB:-}"
+            cp -a "$SUB"/. .
+          fi
+          rm -rf _e
+          ls -la
+          test -f main.py && test -f buildozer.spec && test -d apex
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache buildozer
+        uses: actions/cache@v4
+        with:
+          path: |
+            .buildozer
+            ~/.buildozer
+          key: bzd-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: bzd-${{ runner.os }}-
+
+      - name: Install system deps
+        run: |
+          sudo dpkg --add-architecture i386 || true
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            git unzip zip openjdk-17-jdk python3-pip python3-setuptools \
+            autoconf automake libtool pkg-config cmake ccache build-essential \
+            zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 \
+            libffi-dev libssl-dev libltdl-dev libjpeg-dev libpng-dev \
+            gettext libsqlite3-dev liblzma-dev libbz2-dev \
+            libreadline-dev libgdbm-dev libnss3-dev
+
+      - name: Install Buildozer
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          python -m pip install "cython<3.0" buildozer
+          java -version
+          buildozer --version
+
+      - name: Build APK
+        env:
+          BUILDOZER_WARN_ON_ROOT: "0"
+          ANDROIDSDK: ${{ env.ANDROID_HOME }}
+        run: |
+          # Safer first-time build
+          buildozer -v android debug
+
+      - name: List outputs
+        if: always()
+        run: |
+          ls -la bin/ || true
+          find . -name "*.apk" 2>/dev/null | head || true
+          # show last log lines if present
+          if [ -d .buildozer ]; then
+            find .buildozer -name "*.log" 2>/dev/null | tail -5
+          fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: KALVO-Market-Lab-APK
+          path: bin/*.apk
+          if-no-files-found: error
+          retention-days: 21
