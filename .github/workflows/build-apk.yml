@@ -13,83 +13,141 @@ jobs:
     name: Buildozer Android APK
     runs-on: ubuntu-22.04
     timeout-minutes: 120
+    env:
+      BUILDOZER_WARN_ON_ROOT: "0"
+      APP_ANDROID_ACCEPT_SDK_LICENSE: "1"
+      PYTHONFORANDROID_PREREQUISITES_INSTALL_INTERACTIVE: "0"
     steps:
       - uses: actions/checkout@v4
 
       - name: Extract project zip if needed
         run: |
           set -euo pipefail
-          if [ -f main.py ] && [ -f buildozer.spec ]; then
-            echo "Project at root"
-            ls -la
-            exit 0
-          fi
-          ZIP=$(ls -1 *.zip 2>/dev/null | head -1 || true)
-          if [ -z "${ZIP:-}" ]; then
-            echo "No main.py and no zip"; ls -la; exit 1
-          fi
-          echo "Extracting $ZIP"
-          unzip -o "$ZIP" -d _e
-          if [ -f _e/main.py ] && [ -f _e/buildozer.spec ]; then
-            cp -a _e/. .
+          if [ -f main.py ]; then
+            echo "main.py at root"
           else
-            SUB=$(find _e -name main.py | head -1 | xargs -r dirname)
-            test -n "${SUB:-}"
-            cp -a "$SUB"/. .
+            ZIP=$(ls -1 *.zip 2>/dev/null | head -1 || true)
+            if [ -z "${ZIP:-}" ]; then echo "No main.py/zip"; ls -la; exit 1; fi
+            echo "Extracting $ZIP"
+            unzip -o "$ZIP" -d _e
+            if [ -f _e/main.py ]; then cp -a _e/. .; else
+              SUB=$(find _e -name main.py | head -1 | xargs -r dirname)
+              test -n "${SUB:-}"; cp -a "$SUB"/. .
+            fi
+            rm -rf _e
           fi
-          rm -rf _e
+          test -f main.py
+          test -d apex
           ls -la
-          test -f main.py && test -f buildozer.spec && test -d apex
+
+      - name: Write known-good buildozer.spec
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("buildozer.spec").write_text("""[app]
+          title = KALVO Market Lab
+          package.name = kalvomax
+          package.domain = org.kalvo.lab
+          source.dir = .
+          source.include_exts = py,png,jpg,kv,atlas,json,txt
+          source.exclude_dirs = tests,bin,.git,__pycache__,.buildozer,.github
+          version = 6.1.0
+          requirements = python3,kivy==2.2.1,certifi,pyjnius
+          orientation = portrait
+          fullscreen = 0
+          android.permissions = INTERNET,ACCESS_NETWORK_STATE
+          android.api = 33
+          android.minapi = 24
+          android.ndk = 25b
+          android.sdk = 33
+          android.accept_sdk_license = True
+          android.archs = arm64-v8a
+          android.allow_backup = False
+          p4a.branch = master
+          android.release_artifact = apk
+          android.debug_artifact = apk
+
+          [buildozer]
+          log_level = 2
+          warn_on_root = 0
+          bin_dir = ./bin
+          """.replace("          ", ""))
+          print(Path("buildozer.spec").read_text())
+          PY
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache buildozer
-        uses: actions/cache@v4
-        with:
-          path: |
-            .buildozer
-            ~/.buildozer
-          key: bzd-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
-          restore-keys: bzd-${{ runner.os }}-
-
       - name: Install system deps
         run: |
-          sudo dpkg --add-architecture i386 || true
           sudo apt-get update -y
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             git unzip zip openjdk-17-jdk python3-pip python3-setuptools \
             autoconf automake libtool pkg-config cmake ccache build-essential \
             zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 \
             libffi-dev libssl-dev libltdl-dev libjpeg-dev libpng-dev \
-            gettext libsqlite3-dev liblzma-dev libbz2-dev \
-            libreadline-dev libgdbm-dev libnss3-dev
+            gettext libsqlite3-dev liblzma-dev libbz2-dev
 
-      - name: Install Buildozer
+      - name: Install Buildozer + Cython
         run: |
           python -m pip install --upgrade pip wheel setuptools
-          python -m pip install "cython<3.0" buildozer
-          java -version
+          python -m pip install "cython>=0.29,<3.0" virtualenv
+          python -m pip install git+https://github.com/kivy/buildozer.git
           buildozer --version
 
-      - name: Build APK
-        env:
-          BUILDOZER_WARN_ON_ROOT: "0"
-          ANDROIDSDK: ${{ env.ANDROID_HOME }}
+      - name: Bootstrap platform and patch libthorvg if present
         run: |
-          # Safer first-time build
-          buildozer -v android debug
+          set -euo pipefail
+          buildozer android p4a -- --version || true
+          python3 - <<'PY'
+          from pathlib import Path
+          patched = 0
+          for p in Path(".buildozer").rglob("libthorvg/__init__.py"):
+              t = p.read_text(encoding="utf-8", errors="ignore")
+              if "glob(pattern)[0]" not in t:
+                  print("no fragile glob in", p)
+                  continue
+              t2 = t.replace(
+                  'join(self.ctx.ndk.llvm_prebuilt_dir, "lib/clang/*/lib/linux", lib_arch)',
+                  'join(self.ctx.ndk.llvm_prebuilt_dir, "lib*/clang/*/lib/linux", lib_arch)',
+              )
+              t2 = t2.replace(
+                  "clang_lib_dir = glob(pattern)[0]",
+                  "hits = glob(pattern); clang_lib_dir = hits[0] if hits else None",
+              )
+              t2 = t2.replace(
+                  'libomp = join(clang_lib_dir, "libomp.so")\n            shprint(sh.cp, libomp, join("install", "lib"))',
+                  'if clang_lib_dir:\n                from os.path import exists as _exists\n                libomp = join(clang_lib_dir, "libomp.so")\n                if _exists(libomp):\n                    shprint(sh.cp, libomp, join("install", "lib"))\n                else:\n                    print("libomp missing", libomp)\n            else:\n                print("clang_lib_dir empty; skip libomp")',
+              )
+              if t2 != t:
+                  p.write_text(t2, encoding="utf-8")
+                  patched += 1
+                  print("patched", p)
+              else:
+                  print("unmatched", p)
+                  for i, line in enumerate(t.splitlines()):
+                      if any(k in line for k in ("glob", "libomp", "clang_lib")):
+                          print(i, line)
+          print("patched count", patched)
+          PY
 
-      - name: List outputs
-        if: always()
+      - name: Build APK
+        run: buildozer -v android debug
+
+      - name: Collect logs on failure
+        if: failure()
         run: |
           ls -la bin/ || true
           find . -name "*.apk" 2>/dev/null | head || true
-          # show last log lines if present
-          if [ -d .buildozer ]; then
-            find .buildozer -name "*.log" 2>/dev/null | tail -5
-          fi
+          find .buildozer -type f \( -name "*.log" -o -name "config.log" \) 2>/dev/null | tail -20 | while read f; do
+            echo "----- $f -----"; tail -n 40 "$f" || true
+          done
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
